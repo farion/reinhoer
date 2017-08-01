@@ -6,87 +6,104 @@
 #include <LinkedList.h>
 #include "src/MemoryFree/MemoryFree.h"
 
-#define COMMON_ANODE //for LED
+/**
+   ERRORS
 
-#define RESET 13 // VS1053 reset pin (output)
-#define CS 10 // VS1053 chip select pin (output)
-#define DCS 8 // VS1053 Data/command select pin (output)
-#define DREQ 3 // VS1053 Data request pin (into Arduino)
-#define CARDCS 6 // Card chip select pin
+   1x beep => SD failed.
+   2x beep => Folder can not be opened.
+   3x beep => Folder not found.
+   4x beep => No tracks in tracklist.
+   5x beep => File not found. Can not play.
+*/
+
+#define COMMON_ANODE // Uncomment if your LED has a common anode
+
+#define VS_RESET 13 // VS1053 reset pin (output)
+#define VS_CS 10 // VS1053 chip select pin (output)
+#define VS_DCS 8 // VS1053 Data/command select pin (output)
+#define VS_DREQ 3 // VS1053 Data request pin (into Arduino)
+#define SD_CS 6 // Card chip select pin
 
 #define RFC_CS 2 // CS for RFC
 #define RFC_RESET 11 //RESET for RFC
 
-#define BTN_NEXT 4
-#define BTN_PREV 13
-#define BTN_VOL_UP 12
-#define BTN_VOL_DOWN 5
+#define BTN_NEXT 4 // Arduino pin for next button
+#define BTN_PREV 13 // Arduino pin for prev button
+#define BTN_VOL_UP 12 // Arduino pin for vol up button
+#define BTN_VOL_DOWN 5 // Arduino pin for vol down button
 
-#define RED_LED A2
-#define GREEN_LED A1
-#define BLUE_LED A0
+#define RED_LED A2 // Arduino pin for led red channel
+#define GREEN_LED A1 // Arduino pin for led green channel
+#define BLUE_LED A0 // Arduino pin for led blue channel
 
-#define VOL_INIT 40
+#define VOL_INIT 40 // Initial volume (0-100)
+#define MAX_VOL 100 // Maximal volume (0-100)
 
-#define RFC_MIN_INTERVAL 1000
-/**
-   ERRORS
-
-   1x piep => Player Failed
-   2x piep => SD Card Failed
-   3x piep => No config file on SD
-*/
+#define RFC_MIN_INTERVAL 1000 // Interval in milliseconds between two RFID changes. Leads to less flickering between multiple RFID tokens.
 
 MFRC522 mfrc522(RFC_CS, RFC_RESET);
 
-Adafruit_VS1053_FilePlayer musicPlayer = Adafruit_VS1053_FilePlayer(RESET, CS, DCS, DREQ, CARDCS);
+Adafruit_VS1053_FilePlayer musicPlayer = Adafruit_VS1053_FilePlayer(VS_RESET, VS_CS, VS_DCS, VS_DREQ, SD_CS);
 
 long currentCode = 0;
 int currentTrack = 0;
 LinkedList<int> trackList = LinkedList<int>();
 long cardDeadCounter = 0;
 int currentVolume = VOL_INIT;
+unsigned long lastRfcChange = 0;
 
 Bounce debouncerNext = Bounce();
 Bounce debouncerPrev = Bounce();
 Bounce debouncerVolUp = Bounce();
 Bounce debouncerVolDown = Bounce();
 
-const size_t bufferLen = 80;
-
-unsigned long lastRfcChange = 0;
+void goError(String message, int beepCount) {
+  setColor(186, 0, 0); // Set LED to red
+  for (int i = 0; i < beepCount; i++) {
+    musicPlayer.sineTest(0x44, 300);
+  }
+  Serial.print("[ERR] ");
+  Serial.println(message);
+}
 
 void setup() {
   Serial.begin(9600);
 
-  /*  while (!Serial) {
-      ; // wait for serial port to connect. Needed for Leonardo only
-    }
-  */
+  //initialize LED
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
+
+  //set LED to white
+  setColor(186, 186, 186);
+  
   SPI.begin();
 
   mfrc522.PCD_Init();
 
-
   // initialise the music player
   if (!musicPlayer.begin()) {
-    //musicPlayer.sineTest(0x44, 300);
+    setColor(186, 0, 0); // Set LED to red
     Serial.println("[ERR] VS1053 not found");
+    exit(1);
   } else {
     Serial.println("[INF] VS1053 found");
   }
 
-  if (!SD.begin(CARDCS)) {
-    //musicPlayer.sineTest(0x44, 300);
-    //musicPlayer.sineTest(0x44, 300);
-    Serial.println("[ERR] SD failed");
+  int volume_intial = min(VOL_INIT, MAX_VOL);
+
+  musicPlayer.setVolume(volume_intial,volume_intial); // Set initial volume
+  musicPlayer.useInterrupt(VS1053_FILEPLAYER_PIN_INT); // DREQ int
+
+  //initialize SD card
+  if (!SD.begin(SD_CS)) {
+    goError("SD failed", 1);
+    exit(1);
   } else {
     Serial.println("[INF] SD ok");
   }
 
-  musicPlayer.setVolume(VOL_INIT, VOL_INIT);
-  musicPlayer.useInterrupt(VS1053_FILEPLAYER_PIN_INT); // DREQ int
-
+  //initialize buttons
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_PREV, INPUT_PULLUP);
   pinMode(BTN_VOL_UP, INPUT_PULLUP);
@@ -100,12 +117,6 @@ void setup() {
   debouncerVolUp.interval(5);
   debouncerVolDown.attach(BTN_VOL_DOWN);
   debouncerVolDown.interval(5);
-
-  pinMode(RED_LED, OUTPUT);
-  pinMode(GREEN_LED, OUTPUT);
-  pinMode(BLUE_LED, OUTPUT);
-
-  setColor(0, 186, 0);
 
   printMemUsage();
 }
@@ -127,7 +138,6 @@ void loop() {
 
   if ( mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial())
   {
-
     cardDeadCounter = 0;
     code = 0;
     for (byte i = 0; i < mfrc522.uid.size; i++)
@@ -222,8 +232,8 @@ void fillTrackListByFolderName(String foldername) {
   File albumFolder = SD.open(absoluteFoldername);
 
   if (!albumFolder) {
-    Serial.print(absoluteFoldername);
-    Serial.println(" can not be opened.");
+    goError(String(absoluteFoldername) + " can not be opened.",2);
+    delay(2000);
     return;
   }
 
@@ -259,9 +269,8 @@ String getFilenameByIndices(long code, int track) {
   albumFolder.rewindDirectory();
 
   if (!albumFolder) {
-    Serial.print("[ERR]");
-    Serial.print(absoluteFolderName);
-    Serial.println(" can not be opened.");
+    goError(String(absoluteFolderName) + " can not be opened.",2);
+    delay(2000);
     return String();
   }
   int  i = 0;
@@ -307,9 +316,8 @@ void rfcChanged() {
       trackList.clear();
       currentCode = 0;
       currentTrack = 0;
-      Serial.println("No folder found");
-      setColor(255, 0, 0);
-      delay(1000);
+      goError("No folder found.",3);
+      delay(2000);
       setColor(0, 0, 255);
       return;
     }
@@ -317,7 +325,7 @@ void rfcChanged() {
     lastRfcChange = currentRfcChange;
 
     musicPlayer.stopPlaying();
-    
+
     Serial.print("[USR] New RFID: ");
     Serial.println(currentCode);
     String rootFolder = getFolderNameByCode(currentCode);
@@ -326,9 +334,8 @@ void rfcChanged() {
       trackList.clear();
       currentCode = 0;
       currentTrack = 0;
-      Serial.println("No folder found");
-      setColor(255, 0, 0);
-      delay(1000);
+      goError("No folder found.",3);
+      delay(2000);
       setColor(0, 0, 255);
       return;
     }
@@ -344,8 +351,8 @@ void rfcChanged() {
       currentCode = 0;
       currentTrack = 0;
       Serial.println("No tracks in track list");
-      setColor(255, 0, 0);
-      delay(1000);
+      goError("No tracks in track list.",4);
+      delay(2000);
       setColor(0, 0, 255);
       return;
     }
@@ -374,7 +381,8 @@ void playSpecific(int track) {
   String filename = getFilenameByIndices(currentCode, track);
 
   if (filename.length() == 0) {
-    Serial.println("[ERR] File not found. Can not play");
+    goError("File not found. Can not play.",5);
+      delay(2000);
     return;
   }
 
@@ -422,7 +430,7 @@ void volumeUp() {
 }
 
 void volumeDown() {
-  if (currentVolume < 100) {
+  if (currentVolume < MAX_VOL) {
     currentVolume += 10;
     musicPlayer.setVolume(currentVolume, currentVolume);
     Serial.print("[INF] Volume ");
