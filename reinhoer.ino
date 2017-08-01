@@ -47,7 +47,7 @@ Adafruit_VS1053_FilePlayer musicPlayer = Adafruit_VS1053_FilePlayer(VS_RESET, VS
 
 long currentCode = 0;
 int currentTrack = 0;
-LinkedList<int> trackList = LinkedList<int>();
+LinkedList<String> trackList = LinkedList<String>(); //TODO solve with char* to reduce memory usage
 long cardDeadCounter = 0;
 int currentVolume = VOL_INIT;
 unsigned long lastRfcChange = 0;
@@ -238,21 +238,21 @@ void fillTrackListByFolderName(String foldername) {
   }
 
   albumFolder.rewindDirectory();
-  int  i = 0;
   while (true) {
     File albumFolderEntry =  albumFolder.openNextFile();
     if (! albumFolderEntry) {
       // no more files
       break;
     }
-    if (String(albumFolderEntry.name()).endsWith("MP3") || String(albumFolderEntry.name()).endsWith("OGG")) {
-      trackList.add(i);
-      i++;
+    String entryName = String(albumFolderEntry.name());
+    if (entryName.endsWith("MP3") || entryName.endsWith("OGG")) {
+      trackList.add(entryName);
     }
 
     albumFolderEntry.close();
   }
   albumFolder.close();
+  trackList.sort(fileSortCompare);
 
 }
 
@@ -273,6 +273,8 @@ String getFilenameByIndices(long code, int track) {
     delay(2000);
     return String();
   }
+
+  /*
   int  i = 0;
   while (true) {
 
@@ -295,9 +297,13 @@ String getFilenameByIndices(long code, int track) {
 
     albumFolderEntry.close();
   }
+  */
+  
   albumFolder.close();
 
-  return String();
+  absoluteFolderName += "/";
+  absoluteFolderName += trackList.get(track);
+  return absoluteFolderName;
 }
 
 void rfcChanged() {
@@ -362,7 +368,7 @@ void rfcChanged() {
     Serial.println(" elements.");
 
     //todo check
-    playSpecific(trackList.get(0));
+    playSpecific(0);
   }
 
 }
@@ -373,19 +379,23 @@ void playSpecific(int track) {
 
   printMemUsage();
 
-  Serial.print("[INF] Play track: ");
+  Serial.print("Track ");
   Serial.print(track);
-  Serial.print(" from code ");
-  Serial.println(currentCode);
+  Serial.print("|");
+  Serial.println(trackList.get(track));
 
   String filename = getFilenameByIndices(currentCode, track);
+  
+  Serial.print("[INF] Play track: ");
+  Serial.print(filename);
+  Serial.print(" from code ");
+  Serial.println(currentCode);
 
   if (filename.length() == 0) {
     goError("File not found. Can not play.",5);
       delay(2000);
     return;
   }
-
 
   Serial.print("[INF] Found track file: ");
   Serial.println(filename);
@@ -454,5 +464,10 @@ void setColor(int red, int green, int blue)
   analogWrite(GREEN_LED, green);
   analogWrite(BLUE_LED, blue);
 }
+
+int fileSortCompare(String a, String b) {
+  return a.compareTo(b);
+}
+
 
 
