@@ -1,0 +1,3 @@
+[submodule "src/MemoryFree"]
+	path = src/MemoryFree
+	url = https://github.com/maniacbug/MemoryFree
