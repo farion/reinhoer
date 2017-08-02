@@ -10,3 +10,13 @@ Beep codes are listed here:
   * 3x beep => Folder not found.
   * 4x beep => No tracks in tracklist.
   * 5x beep => File not found. Can not play.
+
+## Needed Libraries
+
+  * SPI: https://www.arduino.cc/en/Reference/SPI
+  * SD: https://www.arduino.cc/en/Reference/SD
+  * VS1053: https://github.com/adafruit/Adafruit_VS1053_Library
+  * RFID: https://github.com/miguelbalboa/rfid
+  * Bounce2: https://github.com/thomasfredericks/Bounce2
+  * LinkedList: https://github.com/ivanseidel/LinkedList
+  * MemoryFree: https://github.com/maniacbug/MemoryFree
