@@ -18,5 +18,4 @@ Beep codes are listed here:
   * VS1053: https://github.com/adafruit/Adafruit_VS1053_Library
   * RFID: https://github.com/miguelbalboa/rfid
   * Bounce2: https://github.com/thomasfredericks/Bounce2
-  * LinkedList: https://github.com/ivanseidel/LinkedList
   * MemoryFree: https://github.com/maniacbug/MemoryFree
