@@ -1,10 +1,13 @@
+//#define DEBUG
+
 #include <SPI.h>
 #include <SD.h>
-#include <Adafruit_VS1053.h>
-#include <MFRC522.h> // RFID Bibliothek Laden
+#include <Adafruit_VS1053.h> // lib for player 
+#include <MFRC522.h> // lib for rfid
 #include <Bounce2.h>
-#include <LinkedList.h>
+#ifdef DEBUG
 #include "src/MemoryFree/MemoryFree.h"
+#endif
 
 /**
    ERRORS
@@ -12,7 +15,7 @@
    1x beep => SD failed.
    2x beep => Folder can not be opened.
    3x beep => Folder not found.
-   4x beep => No tracks in tracklist.
+   4x beep => No tracks in folder.
    5x beep => File not found. Can not play.
 */
 
@@ -36,72 +39,128 @@
 #define GREEN_LED A1 // Arduino pin for led green channel
 #define BLUE_LED A0 // Arduino pin for led blue channel
 
-#define VOL_INIT 40 // Initial volume (0-100)
-#define MAX_VOL 100 // Maximal volume (0-100)
+#define COLOR_OFF 0
+#define COLOR_RED 1
+#define COLOR_BLUE 2
+#define COLOR_GREEN 3
+#define COLOR_WHITE 4
+#define COLOR_PURPLE 5
 
-#define RFC_MIN_INTERVAL 1000 // Interval in milliseconds between two RFID changes. Leads to less flickering between multiple RFID tokens.
+#define VOL_INIT 70 // Initial volume (0-100)
+#define MIN_VOL 100 // Minimal volume (0-100) inverted
+#define MAX_VOL 0 // Maximal volume (0-100) inverted
+
+#define RFC_MIN_INTERVAL 3000 // Interval in milliseconds between two RFID changes. Leads to less flickering between multiple RFID tokens.
+
+#define VOLUME_DIR "VOLUME"
+
+#define MAX_VOL_FILE "/MAXVOL"
+#define CUR_VOL_FILE "/CURVOL"
+
+#define NO_REPEAT_FILE "NOREPEAT"
+
+#define FEEDBACK_TIME 200
+
+#define DEAD_CARD_COUNTER 20
+
+//#define BLINK_INTERVAL 1000
 
 MFRC522 mfrc522(RFC_CS, RFC_RESET);
 
 Adafruit_VS1053_FilePlayer musicPlayer = Adafruit_VS1053_FilePlayer(VS_RESET, VS_CS, VS_DCS, VS_DREQ, SD_CS);
 
+long lastCode = 0;
 long currentCode = 0;
-int currentTrack = 0;
-LinkedList<String> trackList = LinkedList<String>(); //TODO solve with char* to reduce memory usage
+String currentTrack = "";
 long cardDeadCounter = 0;
 int currentVolume = VOL_INIT;
-unsigned long lastRfcChange = 0;
+unsigned long lastRfcChange = -RFC_MIN_INTERVAL;
+String rootFolder;
+int currentMaxVolume;
+bool repeatCurrentAlbum = true;
+
+int ledColor = COLOR_OFF;
+long resetColor = 0;
+
+bool saveMaxVolumeRequest = false;
+bool saveCurrentVolumeRequest = false;
 
 Bounce debouncerNext = Bounce();
 Bounce debouncerPrev = Bounce();
 Bounce debouncerVolUp = Bounce();
 Bounce debouncerVolDown = Bounce();
 
+#ifdef DEBUG
 void goError(String message, int beepCount) {
-  setColor(186, 0, 0); // Set LED to red
+#else
+void goError(int beepCount) {
+#endif
+  
   for (int i = 0; i < beepCount; i++) {
+    setColor(186, 0, 0);
     musicPlayer.sineTest(0x44, 300);
+    delay(1000);
+    musicPlayer.stopPlaying();
+    setColor(0, 0, 0);
   }
+  #ifdef DEBUG
   Serial.print("[ERR] ");
   Serial.println(message);
+  #endif
 }
 
 void setup() {
+  #ifdef DEBUG
   Serial.begin(9600);
+  delay(3000);
+  #endif
 
   //initialize LED
   pinMode(RED_LED, OUTPUT);
   pinMode(GREEN_LED, OUTPUT);
   pinMode(BLUE_LED, OUTPUT);
 
-  //set LED to white
-  setColor(186, 186, 186);
-  
+  //set LED to red
+  setColor(0, 0, 186);
+
   SPI.begin();
 
   mfrc522.PCD_Init();
 
-  // initialise the music player
+  // initialize the music player
   if (!musicPlayer.begin()) {
     setColor(186, 0, 0); // Set LED to red
+    #ifdef DEBUG
     Serial.println("[ERR] VS1053 not found");
+    #endif
     exit(1);
-  } else {
+  } 
+  #ifdef DEBUG
+  else {
     Serial.println("[INF] VS1053 found");
   }
-
-  int volume_intial = min(VOL_INIT, MAX_VOL);
-
-  musicPlayer.setVolume(volume_intial,volume_intial); // Set initial volume
-  musicPlayer.useInterrupt(VS1053_FILEPLAYER_PIN_INT); // DREQ int
-
+  #endif
+  
   //initialize SD card
   if (!SD.begin(SD_CS)) {
+    #ifdef DEBUG
     goError("SD failed", 1);
-    exit(1);
+    #else
+    goError(1);
+    #endif
+        exit(1);
   } else {
+    #ifdef DEBUG
     Serial.println("[INF] SD ok");
+    #endif
   }
+    
+  currentMaxVolume = getMaximalVolume();
+  int initial_volume = getInitialVolume();
+  int volume_intial = max(getInitialVolume(),currentMaxVolume);
+
+  musicPlayer.setVolume(volume_intial, volume_intial); // Set initial volume
+  musicPlayer.useInterrupt(VS1053_FILEPLAYER_PIN_INT); // DREQ int
 
   //initialize buttons
   pinMode(BTN_NEXT, INPUT_PULLUP);
@@ -118,13 +177,19 @@ void setup() {
   debouncerVolDown.attach(BTN_VOL_DOWN);
   debouncerVolDown.interval(5);
 
-  printMemUsage();
+  #ifdef DEBUG
+  printDebug();
+  #endif
+
+  setColor(0, 186, 0);
 }
 
-void printMemUsage() {
-  Serial.print("[DBG] memory = ");
-  Serial.print(freeMemory());
-  Serial.println(" byte");
+int getInitialVolume(){
+  return readIntFromFile(CUR_VOL_FILE,VOL_INIT);
+}
+
+int getMaximalVolume(){
+  return readIntFromFile(MAX_VOL_FILE,MAX_VOL);
 }
 
 void loop() {
@@ -147,48 +212,162 @@ void loop() {
 
   } else {
 
-    if (cardDeadCounter < 3) {
+    if (cardDeadCounter < DEAD_CARD_COUNTER) {
       cardDeadCounter++;
     }
 
-    if (cardDeadCounter == 3  && currentCode != 0) {
+    if (cardDeadCounter == DEAD_CARD_COUNTER  && currentCode != 0) {
       code = 0;
     }
   }
+  
+  if (code != currentCode){
+    unsigned long currentRfcChange = millis();
 
-  if (code != currentCode) {
-    currentCode = code;
-    rfcChanged();
+    bool timelimit = currentRfcChange > lastRfcChange + RFC_MIN_INTERVAL;
+    if(timelimit || code == 0 || lastCode == code) {
+      if(code == 0){
+        lastCode = currentCode;
+      }else{
+        lastRfcChange = currentRfcChange;  
+      }
+      currentCode = code;
+      rfcChanged();
+    }else {
+      if(!timelimit){
+        setColor(200, 0, 0); 
+        delay(RFC_MIN_INTERVAL);
+        setColor(0, 186, 0); 
+      }
+    }
   }
 
-  if ( debouncerNext.fell() ) {
-    Serial.println("[USR] Next pressed");
-    playNext();
+  if(resetColor != 0 && resetColor < millis()){
+    setColor(ledColor);
+    resetColor = 0;
   }
-  if ( debouncerPrev.fell()) {
-    Serial.println("[USR] Prev pressed");
-    playPrev();
+
+  if (debouncerNext.fell() ) {
+    if(!rootFolder.equals(VOLUME_DIR)){
+      #ifdef DEBUG
+      Serial.println("[USR] Next pressed");    
+      #endif
+      startResetColor(COLOR_PURPLE,millis() + FEEDBACK_TIME);
+      playNext();
+    }
   }
-  if ( debouncerVolUp.fell() ) {
+  if (debouncerPrev.fell()) {
+    if(!rootFolder.equals(VOLUME_DIR)){
+      #ifdef DEBUG
+      Serial.println("[USR] Prev pressed");
+      #endif
+      startResetColor(COLOR_PURPLE,millis() + FEEDBACK_TIME);
+      playPrev();
+    }
+  }
+  if ( debouncerVolUp.fell()) {
+    #ifdef DEBUG
     Serial.println("[USR] VolUp pressed");
+    #endif
+    startResetColor(COLOR_PURPLE,millis() + FEEDBACK_TIME);
     volumeUp();
   }
   if ( debouncerVolDown.fell()) {
+    #ifdef DEBUG
     Serial.println("[USR] VolDown pressed");
+    #endif
+    startResetColor(COLOR_PURPLE,millis() + FEEDBACK_TIME);
     volumeDown();
   }
 
-  automaticNext();
+  if(saveMaxVolumeRequest && musicPlayer.stopped()){
+    saveMaxVolume();
+  }
 
+  if(saveCurrentVolumeRequest && musicPlayer.stopped()){
+    saveCurrentVolume();
+  }
+  
+  automaticNext();
 }
 
 void automaticNext() {
 
   if (currentCode != 0 && musicPlayer.stopped()) {
+    #ifdef DEBUG
     Serial.println("[SYS] Automatically play next file");
+    #endif
     playNext();
   }
+}
 
+void rfcChanged() {
+
+  if (currentCode == 0) {
+    musicPlayer.stopPlaying();
+    #ifdef DEBUG
+    Serial.println("[USR] RFID removed");
+    #endif
+    setMainColor(COLOR_GREEN);
+  } else {
+    setMainColor(COLOR_BLUE);
+
+    musicPlayer.stopPlaying();
+
+    #ifdef DEBUG
+    Serial.print("[USR] New RFID: ");
+    Serial.println(currentCode);
+    #endif
+
+    if(currentCode != lastCode){
+      currentTrack = "";
+    }
+    #ifdef DEBUG
+    else{
+      Serial.println("[INF] Same RFID as before, do not clear state.");
+    }
+    #endif
+    
+    rootFolder = getFolderNameByCode(currentCode);
+
+    repeatCurrentAlbum = isRepeat();
+
+    if (rootFolder.length() == 0) {
+      currentCode = 0;
+      currentTrack = "";
+      #ifdef DEBUG
+      goError("No folder found.", 3);
+      #else
+      goError(3);
+      #endif
+      delay(2000);
+      return;
+    }
+
+    #ifdef DEBUG
+    Serial.print("[INF] Found folder ");
+    Serial.print(rootFolder);
+    Serial.print(" with currentCode ");
+    Serial.print(currentCode);
+    Serial.println(".");
+    #endif
+
+    playCurrent();
+  }
+}
+
+bool isRepeat(){
+  String absoluteNoRepeatFileName = String("/");
+  absoluteNoRepeatFileName += rootFolder;
+  absoluteNoRepeatFileName += "/";
+  absoluteNoRepeatFileName += NO_REPEAT_FILE;
+
+  File noRepeatFile = SD.open(absoluteNoRepeatFileName,FILE_READ);
+  if(!noRepeatFile){
+    return true;
+  }
+  noRepeatFile.close();
+  return false;
 }
 
 String getFolderNameByCode(long code) {
@@ -223,235 +402,252 @@ String getFolderNameByCode(long code) {
   return String();
 }
 
-void fillTrackListByFolderName(String foldername) {
-  trackList.clear();
+void playCurrent(){
+
+  musicPlayer.stopPlaying();
 
   String absoluteFoldername = String("/");
-  absoluteFoldername += foldername;
+  absoluteFoldername += rootFolder;
+
+  if(currentTrack.equals("")){
+    playNext();
+    return;
+  }
+
+  playCurrentTrack();
+}
+
+void playPrev(){
+  playDirectSibling(-1);
+}
+
+void playNext(){
+  playDirectSibling(1);
+}
+
+void playDirectSibling(int modificator){
+
+  musicPlayer.stopPlaying();
+  String absoluteFoldername = String("/");
+  absoluteFoldername += rootFolder;
 
   File albumFolder = SD.open(absoluteFoldername);
 
   if (!albumFolder) {
-    goError(String(absoluteFoldername) + " can not be opened.",2);
+    #ifdef DEBUG
+    goError(String(absoluteFoldername) + " can not be opened.", 2);
+    #else
+    goError(2);
+    #endif    
     delay(2000);
     return;
   }
 
   albumFolder.rewindDirectory();
+
+  String candidateTrack = "";
+  String defaultTrack = "";
+  
   while (true) {
     File albumFolderEntry =  albumFolder.openNextFile();
     if (! albumFolderEntry) {
-      // no more files
       break;
     }
     String entryName = String(albumFolderEntry.name());
-    if (entryName.endsWith("MP3") || entryName.endsWith("OGG")) {
-      trackList.add(entryName);
-    }
 
-    albumFolderEntry.close();
-  }
-  albumFolder.close();
-  trackList.sort(fileSortCompare);
+    if(entryName.endsWith(".MP3")){
 
-}
-
-String getFilenameByIndices(long code, int track) {
-
-  Serial.print("[INF] Search folder for code ");
-  Serial.println(code);
-
-  String foldername = getFolderNameByCode(code);
-
-  String absoluteFolderName = String("/");
-  absoluteFolderName += foldername;
-  File albumFolder = SD.open(absoluteFolderName);
-  albumFolder.rewindDirectory();
-
-  if (!albumFolder) {
-    goError(String(absoluteFolderName) + " can not be opened.",2);
-    delay(2000);
-    return String();
-  }
-
-  /*
-  int  i = 0;
-  while (true) {
-
-    File albumFolderEntry =  albumFolder.openNextFile();
-    if (! albumFolderEntry) {
-      // no more files
-      break;
-    }
-
-    if (String(albumFolderEntry.name()).endsWith("MP3") || String(albumFolderEntry.name()).endsWith("OGG")) {
-      if (i == track) {
-        absoluteFolderName += "/";
-        absoluteFolderName += String(albumFolderEntry.name());
-        albumFolderEntry.close();
-        albumFolder.close();
-        return absoluteFolderName;
+      if(defaultTrack.equals("") || modificator * defaultTrack.compareTo(entryName) > 0){
+         defaultTrack = entryName;
       }
-      i++;
+      
+      if(!currentTrack.equals("")){
+        if(candidateTrack.equals("")){
+          if(modificator * entryName.compareTo(currentTrack) > 0){
+            candidateTrack = entryName;
+          }
+        }else{
+          if(modificator * entryName.compareTo(candidateTrack) < 0 && modificator * entryName.compareTo(currentTrack) > 0){
+            candidateTrack = entryName;
+          }
+        }
+      }
     }
 
     albumFolderEntry.close();
   }
-  */
-  
+
   albumFolder.close();
 
-  absoluteFolderName += "/";
-  absoluteFolderName += trackList.get(track);
-  return absoluteFolderName;
-}
-
-void rfcChanged() {
-
-  if (currentCode == 0) {
-    musicPlayer.stopPlaying();
-    Serial.println("[USR] RFID removed");
-    setColor(0, 186, 0);
-  } else {
-    setColor(0, 0, 255);
-    unsigned long currentRfcChange = millis();
-
-    //skip too much changes (happens with multiple tokens at the same time)
-    if (currentRfcChange < lastRfcChange + RFC_MIN_INTERVAL && lastRfcChange != 0) {
-      lastRfcChange = currentRfcChange;
-      trackList.clear();
-      currentCode = 0;
-      currentTrack = 0;
-      goError("No folder found.",3);
-      delay(2000);
-      setColor(0, 0, 255);
-      return;
+  if(candidateTrack.equals("")){
+    if(repeatCurrentAlbum){
+      currentTrack = defaultTrack;
     }
-
-    lastRfcChange = currentRfcChange;
-
-    musicPlayer.stopPlaying();
-
-    Serial.print("[USR] New RFID: ");
-    Serial.println(currentCode);
-    String rootFolder = getFolderNameByCode(currentCode);
-
-    if (rootFolder.length() == 0) {
-      trackList.clear();
-      currentCode = 0;
-      currentTrack = 0;
-      goError("No folder found.",3);
-      delay(2000);
-      setColor(0, 0, 255);
-      return;
-    }
-
-    Serial.print("[INF] Found folder ");
-    Serial.print(rootFolder);
-    Serial.println(".");
-
-    fillTrackListByFolderName(rootFolder);
-
-    if (trackList.size() == 0) {
-      trackList.clear();
-      currentCode = 0;
-      currentTrack = 0;
-      Serial.println("No tracks in track list");
-      goError("No tracks in track list.",4);
-      delay(2000);
-      setColor(0, 0, 255);
-      return;
-    }
-
-    Serial.print("[INF] Track list contains ");
-    Serial.print(trackList.size());
-    Serial.println(" elements.");
-
-    //todo check
-    playSpecific(0);
+  }else{  
+    currentTrack = candidateTrack;
   }
 
+  if(currentTrack.equals("")){
+    #ifdef DEBUG
+    goError("No tracks in folder",4);
+    #else
+    goError(4);
+    #endif
+  }else{
+    playCurrentTrack();
+  }
 }
 
-void playSpecific(int track) {
-
-  musicPlayer.stopPlaying();
-
-  printMemUsage();
-
-  Serial.print("Track ");
-  Serial.print(track);
-  Serial.print("|");
-  Serial.println(trackList.get(track));
-
-  String filename = getFilenameByIndices(currentCode, track);
+void playCurrentTrack(){
   
-  Serial.print("[INF] Play track: ");
-  Serial.print(filename);
-  Serial.print(" from code ");
-  Serial.println(currentCode);
+  String absoluteFileName = String("/");
+  absoluteFileName += rootFolder;;
+  absoluteFileName += "/";
+  absoluteFileName += currentTrack;
 
-  if (filename.length() == 0) {
-    goError("File not found. Can not play.",5);
-      delay(2000);
-    return;
+  #ifdef DEBUG
+  Serial.print("[INF] Play ");
+  Serial.println(absoluteFileName);
+  #endif
+
+  char playFileName[absoluteFileName.length() + 1];
+  
+  absoluteFileName.toCharArray(playFileName, absoluteFileName.length() + 1);
+  if(!musicPlayer.startPlayingFile(playFileName)){
+    #ifdef DEBUG
+    goError("Can not play file",5);
+    #else
+    goError(5);
+    #endif
   }
 
-  Serial.print("[INF] Found track file: ");
-  Serial.println(filename);
-
-  printMemUsage();
-
-  currentTrack = track;
-
-  char playFileName[filename.length() + 1];
-  filename.toCharArray(playFileName, filename.length() + 1);
-
-  musicPlayer.startPlayingFile(playFileName);
-}
-
-void playNext() {
-
-  if (trackList.size() - 1 > currentTrack) {
-    playSpecific(currentTrack + 1);
-  } else {
-    playSpecific(0);
-  }
-}
-
-void playPrev() {
-  if (0 < currentTrack) {
-    playSpecific(currentTrack - 1);
-  } else {
-    playSpecific(trackList.size() - 1);
-  }
+  #ifdef DEBUG
+  printDebug();
+  #endif
 }
 
 void volumeUp() {
-  if (currentVolume > 0) {
+  if (currentVolume > currentMaxVolume || (rootFolder.equals(VOLUME_DIR) && currentVolume > 0)) {
     currentVolume -= 10;
     musicPlayer.setVolume(currentVolume, currentVolume);
+    #ifdef DEBUG
     Serial.print("[INF] Volume ");
     Serial.println(currentVolume);
-    if (musicPlayer.stopped() || musicPlayer.paused()) {
-      musicPlayer.sineTest(0x44, 500);
-    }
+    #endif
+    saveVolume();
   }
 }
 
 void volumeDown() {
-  if (currentVolume < MAX_VOL) {
+  if (currentVolume < MIN_VOL) {
     currentVolume += 10;
     musicPlayer.setVolume(currentVolume, currentVolume);
+    #ifdef DEBUG
     Serial.print("[INF] Volume ");
     Serial.println(currentVolume);
-    if (musicPlayer.stopped() || musicPlayer.paused()) {
-      musicPlayer.sineTest(0x44, 500);
-    }
+    #endif
+    saveVolume();
   }
 }
 
+void saveVolume(){
+  if(rootFolder.equals(VOLUME_DIR)){
+    currentMaxVolume = currentVolume;
+    saveMaxVolumeRequest = true;
+  }
+  saveCurrentVolumeRequest = true;
+}
 
+void saveMaxVolume(){
+  writeIntToFile(MAX_VOL_FILE,currentVolume); 
+  saveMaxVolumeRequest = false;
+}
+
+void saveCurrentVolume(){
+  writeIntToFile(CUR_VOL_FILE,currentVolume);
+  saveCurrentVolumeRequest = false;
+}
+
+int readIntFromFile(String filename, int def){
+  #ifdef DEBUG
+  Serial.print("[INF] Read from file ");
+  Serial.println(filename);
+  if(SD.exists(filename)){
+    Serial.println("[INF] File exists");
+  }
+  #endif
+  File file = SD.open(filename,FILE_READ);
+  if(file){
+    char result[3];
+    uint8_t i = 0;
+    do {
+      result[i] = file.read();
+      i++;
+    }while(i < 3 && result[i] != '\0');
+    file.close();
+
+    int value = atoi(result);
+
+    #ifdef DEBUG
+    Serial.print("[INF] Read Value ");
+    Serial.println(value);
+    #endif
+    
+    return  value;
+  }
+
+  #ifdef DEBUG
+  Serial.print("[INF] Use default ");
+  Serial.println(def);
+  #endif
+  
+  return def;
+}
+
+void writeIntToFile(String filename, int i){
+  if(SD.exists(filename)){
+    SD.remove(filename);
+  }
+
+  File file = SD.open(filename, FILE_WRITE);
+  #ifdef DEBUG
+  Serial.print("[INF] Write to file ");
+  Serial.print(filename);
+  Serial.print(" value ");
+  Serial.println(i);
+  #endif
+  file.println(i);
+  file.close();
+}
+
+void startResetColor(int color, long dela){
+      setColor(color);
+      resetColor = dela;
+}
+
+void setMainColor(int color){
+  setColor(color);
+  
+  ledColor = color;
+  resetColor = 0;
+}
+
+void setColor(int color){
+  if(color == COLOR_OFF){
+     setColor(0,0,0);
+  }else if(color == COLOR_RED){
+    setColor(200,0,0);
+  }else if(color == COLOR_BLUE){
+    setColor(0,0,200);
+  }else if(color == COLOR_GREEN){
+    setColor(0,200,0);
+  }else if(color == COLOR_WHITE){
+    setColor(200,200,200);
+  }else if(color == COLOR_PURPLE){
+    setColor(200,0,200);
+  }
+
+}
 
 void setColor(int red, int green, int blue)
 {
@@ -465,9 +661,22 @@ void setColor(int red, int green, int blue)
   analogWrite(BLUE_LED, blue);
 }
 
-int fileSortCompare(String a, String b) {
-  return a.compareTo(b);
+
+#ifdef DEBUG
+void printDebug() {
+  Serial.print("[DBG] memory = ");
+  Serial.print(freeMemory());
+  Serial.print(" byte / currentTrack = ");
+  Serial.print(currentTrack);
+  Serial.print(" / currentCode = ");
+  Serial.print(currentCode);
+  Serial.print(" / lastCode = ");
+  Serial.print(lastCode);
+  Serial.print(" / rootFolder = ");
+  Serial.println(rootFolder);
 }
+#endif
+
 
 
 
